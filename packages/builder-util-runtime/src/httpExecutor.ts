@@ -1,18 +1,56 @@
 import { BinaryToTextEncoding, createHash, Hash } from "crypto"
+import { sleep } from "./retry.js"
 import _debug from "debug"
 import { createWriteStream } from "fs"
-import { IncomingMessage, OutgoingHttpHeaders, RequestOptions } from "http"
+import { IncomingMessage, OutgoingHttpHeader, OutgoingHttpHeaders, RequestOptions } from "http"
 import { Socket } from "net"
 import { Transform } from "stream"
 import { URL } from "url"
-import { CancellationToken } from "./CancellationToken"
-import { newError } from "./index"
-import { ProgressCallbackTransform, ProgressInfo } from "./ProgressCallbackTransform"
+import { Nullish } from "./index.js"
+import { CancellationToken } from "./CancellationToken.js"
+import { newError } from "./error.js"
+import { deepAssign } from "./objects.js"
+import { ProgressCallbackTransform, ProgressInfo } from "./ProgressCallbackTransform.js"
 
 const debug = _debug("electron-builder")
 
+// ── Sensitive-data registries ────────────────────────────────────────────────
+
+// Normalise a header or field name: lowercase + strip all separators (- and _).
+// Shared by both registries so lookup is always separator-agnostic.
+const normalizeName = (name: string): string => name.toLowerCase().replace(/[-_]/g, "")
+
+// HTTP header names (normalised) stripped on cross-origin redirects.
+// Stored normalised; lookup normalises the incoming key with normalizeName().
+const SENSITIVE_REDIRECT_HEADERS = new Set(["authorization", "proxyauthorization", "privatetoken", "xapikey", "xauthtoken", "xaccesstoken", "xgitlabtoken", "cookie", "xcsrftoken"])
+
+// Substrings: a field name containing any of these (after normalization) is redacted.
+const SENSITIVE_FIELD_PATTERNS: string[] = ["token", "password", "secret", "authorization", "credential", "apikey", "passphrase", "auth"] as const
+
+// Suffixes: a field name ending with any of these (after normalization) is redacted.
+// Intentionally greedy — "publicKey" is also stripped; over-stripping debug logs is
+// acceptable, under-stripping a credential is not.
+const SENSITIVE_FIELD_SUFFIXES: string[] = ["key"] as const
+
+/**
+ * Register an additional HTTP header to strip on cross-origin redirects.
+ * Intended for custom publishers (e.g. GenericPublisher with a non-standard auth header).
+ */
+export function addSensitiveRedirectHeader(header: string): void {
+  SENSITIVE_REDIRECT_HEADERS.add(normalizeName(header))
+}
+
+/**
+ * Register an additional substring pattern used by {@link safeStringifyJson} to
+ * identify sensitive field names. Input is normalized (lowercased, separators stripped).
+ * Intended for custom publishers that store credentials under non-standard field names.
+ */
+export function addSensitiveFieldPattern(pattern: string): void {
+  SENSITIVE_FIELD_PATTERNS.push(pattern.toLowerCase().replace(/[-_]/g, ""))
+}
+
 export interface RequestHeaders extends OutgoingHttpHeaders {
-  [key: string]: string
+  [key: string]: OutgoingHttpHeader | undefined
 }
 
 export interface DownloadOptions {
@@ -54,11 +92,19 @@ const HTTP_STATUS_CODES = new Map<number, string>([
 ])
 
 export class HttpError extends Error {
-  constructor(readonly statusCode: number, message = `HTTP error: ${HTTP_STATUS_CODES.get(statusCode) || statusCode}`, readonly description: any | null = null) {
+  constructor(
+    readonly statusCode: number,
+    message = `HTTP error: ${HTTP_STATUS_CODES.get(statusCode) || statusCode}`,
+    readonly description: any | null = null
+  ) {
     super(message)
 
     this.name = "HttpError"
     ;(this as NodeJS.ErrnoException).code = `HTTP_ERROR_${statusCode}`
+  }
+
+  isServerError() {
+    return this.statusCode >= 500 && this.statusCode <= 599
   }
 }
 
@@ -66,43 +112,59 @@ export function parseJson(result: Promise<string | null>) {
   return result.then(it => (it == null || it.length === 0 ? null : JSON.parse(it)))
 }
 
-export abstract class HttpExecutor<REQUEST> {
+interface Request {
+  abort: () => void
+  end: (data?: Buffer) => void
+}
+export abstract class HttpExecutor<T extends Request> {
   protected readonly maxRedirects = 10
 
   request(options: RequestOptions, cancellationToken: CancellationToken = new CancellationToken(), data?: { [name: string]: any } | null): Promise<string | null> {
     configureRequestOptions(options)
-    const encodedData = data == null ? undefined : Buffer.from(JSON.stringify(data))
+    const json = data == null ? undefined : JSON.stringify(data)
+    const encodedData = json ? Buffer.from(json) : undefined
     if (encodedData != null) {
-      options.method = "post"
-      options.headers!["Content-Type"] = "application/json"
-      options.headers!["Content-Length"] = encodedData.length
+      if (debug.enabled) {
+        debug(safeStringifyJson(data))
+      }
+      const { headers, ...opts } = options
+      options = {
+        method: "post",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": encodedData.length,
+          ...headers,
+        },
+        ...opts,
+      }
     }
-    return this.doApiRequest(options, cancellationToken, it => {
-      ;(it as any).end(encodedData)
-    })
+    return this.doApiRequest(options, cancellationToken, it => it.end(encodedData))
   }
 
   doApiRequest(
     options: RequestOptions,
     cancellationToken: CancellationToken,
-    requestProcessor: (request: REQUEST, reject: (error: Error) => void) => void,
+    requestProcessor: (request: T, reject: (error: Error) => void) => void,
     redirectCount = 0
   ): Promise<string> {
     if (debug.enabled) {
-      debug(`Request: ${safeStringifyJson(options)}`)
+      const { headers: _headers, auth: _auth, ...safeOptions } = options as any
+      debug(`Request: ${safeStringifyJson(safeOptions)}`)
     }
 
     return cancellationToken.createPromise<string>((resolve, reject, onCancel) => {
       const request = this.createRequest(options, (response: any) => {
         try {
           this.handleResponse(response, options, cancellationToken, resolve, reject, redirectCount, requestProcessor)
-        } catch (e) {
+        } catch (e: any) {
           reject(e)
         }
       })
-      this.addErrorAndTimeoutHandlers(request, reject)
+      this.addErrorAndTimeoutHandlers(request, reject, options.timeout)
       this.addRedirectHandlers(request, options, reject, redirectCount, options => {
-        this.doApiRequest(options, cancellationToken, requestProcessor, redirectCount).then(resolve).catch(reject)
+        this.doApiRequest(options, cancellationToken, requestProcessor, redirectCount + 1)
+          .then(resolve)
+          .catch(reject)
       })
       requestProcessor(request, reject)
       onCancel(() => request.abort())
@@ -115,8 +177,8 @@ export abstract class HttpExecutor<REQUEST> {
     // not required for NodeJS
   }
 
-  addErrorAndTimeoutHandlers(request: any, reject: (error: Error) => void) {
-    this.addTimeOutHandler(request, reject)
+  addErrorAndTimeoutHandlers(request: any, reject: (error: Error) => void, timeout = 60 * 1000) {
+    this.addTimeOutHandler(request, reject, timeout)
     request.on("error", reject)
     request.on("aborted", () => {
       reject(new Error("Request has been aborted by the server"))
@@ -130,10 +192,11 @@ export abstract class HttpExecutor<REQUEST> {
     resolve: (data?: any) => void,
     reject: (error: Error) => void,
     redirectCount: number,
-    requestProcessor: (request: REQUEST, reject: (error: Error) => void) => void
+    requestProcessor: (request: T, reject: (error: Error) => void) => void
   ) {
     if (debug.enabled) {
-      debug(`Response: ${response.statusCode} ${response.statusMessage}, request options: ${safeStringifyJson(options)}`)
+      const { headers: _headers, auth: _auth, ...safeOptions } = options as any
+      debug(`Response: ${response.statusCode} ${response.statusMessage}, request options: ${safeStringifyJson(safeOptions)}`)
     }
 
     // we handle any other >= 400 error on request end (read detailed message in the response body)
@@ -144,7 +207,7 @@ export abstract class HttpExecutor<REQUEST> {
           response,
           `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
 
-Please double check that your authentication token is correct. Due to security reasons actual status maybe not reported, but 404.
+Please double check that your authentication token is correct. Due to security reasons, actual status maybe not reported, but 404.
 `
         )
       )
@@ -155,14 +218,18 @@ Please double check that your authentication token is correct. Due to security r
       return
     }
 
+    const code = response.statusCode ?? 0
+    const shouldRedirect = code >= 300 && code < 400
     const redirectUrl = safeGetHeader(response, "location")
-    if (redirectUrl != null) {
-      if (redirectCount > this.maxRedirects) {
+    if (shouldRedirect && redirectUrl != null) {
+      if (redirectCount >= this.maxRedirects) {
         reject(this.createMaxRedirectError())
         return
       }
 
-      this.doApiRequest(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, options), cancellationToken, requestProcessor, redirectCount).then(resolve).catch(reject)
+      this.doApiRequest(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, options), cancellationToken, requestProcessor, redirectCount + 1)
+        .then(resolve)
+        .catch(reject)
       return
     }
 
@@ -176,22 +243,31 @@ Please double check that your authentication token is correct. Due to security r
         if (response.statusCode != null && response.statusCode >= 400) {
           const contentType = safeGetHeader(response, "content-type")
           const isJson = contentType != null && (Array.isArray(contentType) ? contentType.find(it => it.includes("json")) != null : contentType.includes("json"))
-          reject(createHttpError(response, isJson ? JSON.parse(data) : data))
+          reject(
+            createHttpError(
+              response,
+              `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
+
+          Data:
+          ${isJson ? safeStringifyJson(JSON.parse(data)) : data}
+          `
+            )
+          )
         } else {
           resolve(data.length === 0 ? null : data)
         }
-      } catch (e) {
+      } catch (e: any) {
         reject(e)
       }
     })
   }
 
   // noinspection JSUnusedLocalSymbols
-  abstract createRequest(options: any, callback: (response: any) => void): any
+  abstract createRequest(options: RequestOptions, callback: (response: any) => void): T
 
   async downloadToBuffer(url: URL, options: DownloadOptions): Promise<Buffer> {
     return await options.cancellationToken.createPromise<Buffer>((resolve, reject, onCancel) => {
-      let result: Buffer | null = null
+      const responseChunks: Buffer[] = []
       const requestOptions = {
         headers: options.headers || undefined,
         // because PrivateGitHubProvider requires HttpExecutor.prepareRedirectUrlOptions logic, so, we need to redirect manually
@@ -207,46 +283,35 @@ Please double check that your authentication token is correct. Due to security r
           onCancel,
           callback: error => {
             if (error == null) {
-              resolve(result!)
+              resolve(Buffer.concat(responseChunks))
             } else {
               reject(error)
             }
           },
           responseHandler: (response, callback) => {
-            const contentLength = safeGetHeader(response, "content-length")
-            let position = -1
-            if (contentLength != null) {
-              const size = parseInt(contentLength, 10)
-              if (size > 0) {
-                if (size > 524288000) {
-                  callback(new Error("Maximum allowed size is 500 MB"))
-                  return
-                }
-
-                result = Buffer.alloc(size)
-                position = 0
+            let receivedLength = 0
+            let isDone = false
+            const finish = (error: Error | null) => {
+              if (isDone) {
+                return
               }
+              isDone = true
+              callback(error)
             }
             response.on("data", (chunk: Buffer) => {
-              if (position !== -1) {
-                chunk.copy(result!, position)
-                position += chunk.length
-              } else if (result == null) {
-                result = chunk
-              } else {
-                if (result.length > 524288000) {
-                  callback(new Error("Maximum allowed size is 500 MB"))
-                  return
-                }
-                result = Buffer.concat([result, chunk])
+              if (isDone) {
+                return
               }
+              receivedLength += chunk.length
+              if (receivedLength > 524288000) {
+                finish(new Error("Maximum allowed size is 500 MB"))
+                response.destroy()
+                return
+              }
+              responseChunks.push(chunk)
             })
             response.on("end", () => {
-              if (result != null && position !== -1 && position !== result.length) {
-                callback(new Error(`Received data length ${position} is not equal to expected ${result.length}`))
-              } else {
-                callback(null)
-              }
+              finish(null)
             })
           },
         },
@@ -255,7 +320,7 @@ Please double check that your authentication token is correct. Due to security r
     })
   }
 
-  protected doDownload(requestOptions: any, options: DownloadCallOptions, redirectCount: number) {
+  protected doDownload(requestOptions: RequestOptions, options: DownloadCallOptions, redirectCount: number) {
     const request = this.createRequest(requestOptions, (response: IncomingMessage) => {
       if (response.statusCode! >= 400) {
         options.callback(
@@ -274,7 +339,7 @@ Please double check that your authentication token is correct. Due to security r
       const redirectUrl = safeGetHeader(response, "location")
       if (redirectUrl != null) {
         if (redirectCount < this.maxRedirects) {
-          this.doDownload(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, requestOptions), options, redirectCount++)
+          this.doDownload(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, requestOptions), options, redirectCount + 1)
         } else {
           options.callback(this.createMaxRedirectError())
         }
@@ -287,9 +352,9 @@ Please double check that your authentication token is correct. Due to security r
         options.responseHandler(response, options.callback)
       }
     })
-    this.addErrorAndTimeoutHandlers(request, options.callback)
+    this.addErrorAndTimeoutHandlers(request, options.callback, requestOptions.timeout)
     this.addRedirectHandlers(request, requestOptions, options.callback, redirectCount, requestOptions => {
-      this.doDownload(requestOptions, options, redirectCount++)
+      this.doDownload(requestOptions, options, redirectCount + 1)
     })
     request.end()
   }
@@ -298,9 +363,9 @@ Please double check that your authentication token is correct. Due to security r
     return new Error(`Too many redirects (> ${this.maxRedirects})`)
   }
 
-  private addTimeOutHandler(request: any, callback: (error: Error) => void) {
+  private addTimeOutHandler(request: any, callback: (error: Error) => void, timeout: number) {
     request.on("socket", (socket: Socket) => {
-      socket.setTimeout(60 * 1000, () => {
+      socket.setTimeout(timeout, () => {
         request.abort()
         callback(new Error("Request timed out"))
       })
@@ -310,13 +375,119 @@ Please double check that your authentication token is correct. Due to security r
   static prepareRedirectUrlOptions(redirectUrl: string, options: RequestOptions): RequestOptions {
     const newOptions = configureRequestOptionsFromUrl(redirectUrl, { ...options })
     const headers = newOptions.headers
-    if (headers != null && headers.authorization != null && (headers.authorization as string).startsWith("token")) {
-      const parsedNewUrl = new URL(redirectUrl)
-      if (parsedNewUrl.hostname.endsWith(".amazonaws.com") || parsedNewUrl.searchParams.has("X-Amz-Credential")) {
-        delete headers.authorization
+    if (headers == null) {
+      return newOptions
+    }
+
+    const originalUrl = HttpExecutor.reconstructOriginalUrl(options)
+    const parsedRedirectUrl = parseUrl(redirectUrl, options)
+
+    if (HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {
+      if (debug.enabled) {
+        debug(`Cross-origin redirect (${originalUrl.host} → ${parsedRedirectUrl.host}): stripping sensitive headers`)
+      }
+      for (const key of Object.keys(headers)) {
+        if (SENSITIVE_REDIRECT_HEADERS.has(normalizeName(key))) {
+          delete (headers as Record<string, unknown>)[key]
+        }
       }
     }
     return newOptions
+  }
+
+  /**
+   * `headers` without the credential-bearing ones stripped on cross-origin redirects (see {@link addSensitiveRedirectHeader})
+   * when `targetUrl` is on another origin than `originUrl` (same rule as a redirect), else `headers` itself. Never mutates `headers`.
+   */
+  static removeCrossOriginSensitiveHeaders(headers: OutgoingHttpHeaders, originUrl: URL, targetUrl: URL): OutgoingHttpHeaders {
+    if (!HttpExecutor.isCrossOriginRedirect(originUrl, targetUrl)) {
+      return headers
+    }
+    if (debug.enabled) {
+      debug(`Cross-origin request (${originUrl.host} → ${targetUrl.host}): stripping sensitive headers`)
+    }
+    const result = deepAssign<OutgoingHttpHeaders>({}, headers)
+    for (const key of Object.keys(result)) {
+      if (SENSITIVE_REDIRECT_HEADERS.has(normalizeName(key))) {
+        delete result[key]
+      }
+    }
+    return result
+  }
+
+  /** The names in `headers` of the credential-bearing headers stripped on cross-origin redirects (see {@link addSensitiveRedirectHeader}). */
+  static sensitiveHeaderNames(headers: OutgoingHttpHeaders): Array<string> {
+    return Object.keys(headers).filter(key => headers[key] != null && SENSITIVE_REDIRECT_HEADERS.has(normalizeName(key)))
+  }
+
+  private static reconstructOriginalUrl(options: RequestOptions): URL {
+    const protocol = options.protocol || "https:"
+    if (!options.hostname) {
+      throw new Error("Missing hostname in request options")
+    }
+    const hostname = options.hostname
+    const port = options.port ? `:${options.port}` : ""
+    const path = options.path || "/"
+    return new URL(`${protocol}//${hostname}${port}${path}`)
+  }
+
+  /**
+   * Whether `targetUrl` is on another origin than `originUrl` for the purpose of sending credentials: another host, port or
+   * scheme, except an `http` → `https` upgrade of the same host on the default ports.
+   */
+  static isCrossOrigin(originUrl: URL, targetUrl: URL): boolean {
+    return HttpExecutor.isCrossOriginRedirect(originUrl, targetUrl)
+  }
+
+  private static isCrossOriginRedirect(originalUrl: URL, redirectUrl: URL): boolean {
+    // Case-insensitive hostname comparison
+    if (originalUrl.hostname.toLowerCase() !== redirectUrl.hostname.toLowerCase()) {
+      return true
+    }
+
+    // Special case: allow http -> https redirect on same host with standard ports
+    // This matches the behavior of Python requests library for backward compatibility
+    // url.port returns an empty string if the port is omitted
+    // or explicitly set to the default port for a given protocol.
+    if (
+      originalUrl.protocol === "http:" &&
+      // This can be replaced with `!originalUrl.port`, but for the sake of clarity.
+      ["80", ""].includes(originalUrl.port) &&
+      redirectUrl.protocol === "https:" &&
+      // This can be replaced with `!redirectUrl.port`, but for the sake of clarity.
+      ["443", ""].includes(redirectUrl.port)
+    ) {
+      return false
+    }
+
+    // According to RFC 7235, a change in protocol or port constitutes a cross-origin request.
+    // Forwarding authentication headers to a different origin can be a security risk.
+    // For example, https://example.com:443 and http://example.com:80 are different origins.
+    // We only make an exception for HTTP -> HTTPS upgrades on standard ports for backward compatibility.
+
+    // Strip auth on any other protocol change
+    if (originalUrl.protocol !== redirectUrl.protocol) {
+      return true
+    }
+
+    // Strip auth on port change (accounting for default ports)
+    const originalPort = originalUrl.port
+    const redirectPort = redirectUrl.port
+    return originalPort !== redirectPort
+  }
+
+  static async retryOnServerError(task: () => Promise<any>, maxRetries = 3): Promise<any> {
+    for (let attemptNumber = 0; ; attemptNumber++) {
+      try {
+        return await task()
+      } catch (e: any) {
+        if (attemptNumber < maxRetries && ((e instanceof HttpError && e.isServerError()) || e.code === "EPIPE")) {
+          await sleep(1000 * (attemptNumber + 1))
+          continue
+        }
+        throw e
+      }
+    }
   }
 }
 
@@ -330,9 +501,24 @@ export interface DownloadCallOptions {
   destination: string | null
 }
 
+function parseUrl(url: string, options: RequestOptions): URL {
+  try {
+    // Would throw exception if url is not absolute
+    return new URL(url)
+  } catch {
+    // Relative URL - construct base URL from original options
+    const hostname = options.hostname
+    const protocol = options.protocol || "https:"
+    const port = options.port ? `:${options.port}` : ""
+    const baseUrl = `${protocol}//${hostname}${port}`
+    return new URL(url, baseUrl)
+  }
+}
+
 export function configureRequestOptionsFromUrl(url: string, options: RequestOptions) {
   const result = configureRequestOptions(options)
-  configureRequestUrl(new URL(url), result)
+  const parsedUrl = parseUrl(url, options)
+  configureRequestUrl(parsedUrl, result)
   return result
 }
 
@@ -359,7 +545,11 @@ export class DigestTransform extends Transform {
 
   isValidateOnEnd = true
 
-  constructor(readonly expected: string, private readonly algorithm: string = "sha512", private readonly encoding: BinaryToTextEncoding = "base64") {
+  constructor(
+    readonly expected: string,
+    private readonly algorithm: string = "sha512",
+    private readonly encoding: BinaryToTextEncoding = "base64"
+  ) {
     super()
 
     this.digester = createHash(algorithm)
@@ -378,7 +568,7 @@ export class DigestTransform extends Transform {
     if (this.isValidateOnEnd) {
       try {
         this.validate()
-      } catch (e) {
+      } catch (e: any) {
         callback(e)
         return
       }
@@ -400,7 +590,7 @@ export class DigestTransform extends Transform {
   }
 }
 
-function checkSha2(sha2Header: string | null | undefined, sha2: string | null | undefined, callback: (error: Error | null) => void): boolean {
+function checkSha2(sha2Header: string | Nullish, sha2: string | Nullish, callback: (error: Error | null) => void): boolean {
   if (sha2Header != null && sha2 != null && sha2Header !== sha2) {
     callback(new Error(`checksum mismatch: expected ${sha2} but got ${sha2Header} (X-Checksum-Sha2 header)`))
     return false
@@ -420,6 +610,23 @@ export function safeGetHeader(response: any, headerKey: string) {
   }
 }
 
+/**
+ * electron-builder has emitted base64-encoded sha512 values in latest*.yml since 19.x (2017); hex-encoded values
+ * are a legacy back-compat path for pre-19.x manifests or hand-rolled manifests built from raw `sha512sum` output.
+ * Detection is unambiguous: base64-encoded sha512 is always 88 characters ending in "==", so it can never match the
+ * strict 128-hex-character pattern (and a wrong pick would only fail closed with ERR_CHECKSUM_MISMATCH).
+ *
+ * Hex-encoded sha512 manifest values are deprecated and support will be removed in v28 — emit base64 instead.
+ */
+export function detectSha512Encoding(sha512: string): BinaryToTextEncoding {
+  const isLegacyHex = sha512.length === 128 && /^[0-9a-fA-F]{128}$/.test(sha512)
+  if (isLegacyHex) {
+    debug("Deprecation warning: hex-encoded sha512 detected in the update manifest. Hex support is deprecated and will be removed in v28 — emit base64 instead.")
+    return "hex"
+  }
+  return "base64"
+}
+
 function configurePipes(options: DownloadCallOptions, response: IncomingMessage) {
   if (!checkSha2(safeGetHeader(response, "X-Checksum-Sha2"), options.options.sha2, options.callback)) {
     return
@@ -435,7 +642,7 @@ function configurePipes(options: DownloadCallOptions, response: IncomingMessage)
 
   const sha512 = options.options.sha512
   if (sha512 != null) {
-    streams.push(new DigestTransform(sha512, "sha512", sha512.length === 128 && !sha512.includes("+") && !sha512.includes("Z") && !sha512.includes("=") ? "hex" : "base64"))
+    streams.push(new DigestTransform(sha512, "sha512", detectSha512Encoding(sha512)))
   } else if (options.options.sha2 != null) {
     streams.push(new DigestTransform(options.options.sha2, "sha256", "hex"))
   }
@@ -446,6 +653,7 @@ function configurePipes(options: DownloadCallOptions, response: IncomingMessage)
   let lastStream = response
   for (const stream of streams) {
     stream.on("error", (error: Error) => {
+      fileOut.close()
       if (!options.options.cancellationToken.cancelled) {
         options.callback(error)
       }
@@ -453,12 +661,30 @@ function configurePipes(options: DownloadCallOptions, response: IncomingMessage)
     lastStream = lastStream.pipe(stream)
   }
 
+  // .pipe() does not pass a failure of its source on: a response that errors or is aborted before its end (lost connection,
+  // a request timeout, Electron's request.abort() destroying it) would leave the transforms and fileOut, and with it the
+  // destination's file descriptor, open for the life of the process. The error itself is reported by whoever ended it.
+  let isResponseEnded = false
+  response.on("end", () => {
+    isResponseEnded = true
+  })
+  const destroyStreams = () => {
+    if (!isResponseEnded) {
+      for (const stream of streams) {
+        stream.destroy()
+      }
+    }
+  }
+  response.on("error", destroyStreams)
+  response.on("aborted", destroyStreams)
+  response.on("close", destroyStreams)
+
   fileOut.on("finish", () => {
     ;(fileOut.close as any)(options.callback)
   })
 }
 
-export function configureRequestOptions(options: RequestOptions, token?: string | null, method?: "GET" | "DELETE" | "PUT"): RequestOptions {
+export function configureRequestOptions(options: RequestOptions, token?: string | null, method?: "GET" | "DELETE" | "PUT" | "POST"): RequestOptions {
   if (method != null) {
     options.method = method
   }
@@ -467,7 +693,7 @@ export function configureRequestOptions(options: RequestOptions, token?: string 
   const headers = options.headers
 
   if (token != null) {
-    ;(headers as any).authorization = token.startsWith("Basic") ? token : `token ${token}`
+    ;(headers as any).authorization = token.startsWith("Basic") || token.startsWith("Bearer") ? token : `token ${token}`
   }
   if (headers["User-Agent"] == null) {
     headers["User-Agent"] = "electron-builder"
@@ -484,20 +710,21 @@ export function configureRequestOptions(options: RequestOptions, token?: string 
   return options
 }
 
-export function safeStringifyJson(data: any, skippedNames?: Set<string>) {
+export function isSensitiveFieldName(name: string): boolean {
+  const normalized = normalizeName(name)
+  return SENSITIVE_FIELD_PATTERNS.some(p => normalized.includes(p)) || SENSITIVE_FIELD_SUFFIXES.some(s => normalized.endsWith(s))
+}
+
+export function hashSensitiveValue(value: string): string {
+  return `${createHash("sha256").update(value).digest("hex")} (sha256 hash)`
+}
+
+export function safeStringifyJson(data: any, skippedNames?: Set<string>): string {
   return JSON.stringify(
     data,
     (name, value) => {
-      if (
-        name.endsWith("authorization") ||
-        name.endsWith("Password") ||
-        name.endsWith("PASSWORD") ||
-        name.endsWith("Token") ||
-        name.includes("password") ||
-        name.includes("token") ||
-        (skippedNames != null && skippedNames.has(name))
-      ) {
-        return "<stripped sensitive data>"
+      if (isSensitiveFieldName(name) || (skippedNames != null && skippedNames.has(name))) {
+        return typeof value === "string" ? hashSensitiveValue(value) : "<stripped sensitive data>"
       }
       return value
     },

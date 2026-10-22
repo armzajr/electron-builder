@@ -1,9 +1,9 @@
 import { createHttpError, safeGetHeader } from "builder-util-runtime"
 import { IncomingMessage } from "http"
 import { Writable } from "stream"
-import { copyData, DataSplitter, PartListDataTask } from "./DataSplitter"
-import { DifferentialDownloader } from "./DifferentialDownloader"
-import { Operation, OperationKind } from "./downloadPlanBuilder"
+import { copyData, DataSplitter, PartListDataTask } from "./DataSplitter.js"
+import { DifferentialDownloader } from "./DifferentialDownloader.js"
+import { Operation, OperationKind } from "./downloadPlanBuilder.js"
 
 export function executeTasksUsingMultipleRangeRequests(
   differentialDownloader: DifferentialDownloader,
@@ -41,6 +41,7 @@ export function executeTasksUsingMultipleRangeRequests(
 function doExecuteTasks(differentialDownloader: DifferentialDownloader, options: PartListDataTask, out: Writable, resolve: () => void, reject: (error: Error) => void): void {
   let ranges = "bytes="
   let partCount = 0
+  let grandTotalBytes = 0
   const partIndexToTaskIndex = new Map<number, number>()
   const partIndexToLength: Array<number> = []
   for (let i = options.start; i < options.end; i++) {
@@ -50,6 +51,7 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
       partIndexToTaskIndex.set(partCount, i)
       partCount++
       partIndexToLength.push(task.end - task.start)
+      grandTotalBytes += task.end - task.start
     }
   }
 
@@ -69,6 +71,8 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
         const requestOptions = differentialDownloader.createRequestOptions()
         requestOptions.headers!.Range = `bytes=${task.start}-${task.end - 1}`
         const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
+          response.on("error", reject)
+
           if (!checkIsRangesSupported(response, reject)) {
             return
           }
@@ -90,23 +94,56 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
   const requestOptions = differentialDownloader.createRequestOptions()
   requestOptions.headers!.Range = ranges.substring(0, ranges.length - 2)
   const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
+    response.on("error", reject)
+
     if (!checkIsRangesSupported(response, reject)) {
       return
     }
 
     const contentType = safeGetHeader(response, "content-type")
-    const m = /^multipart\/.+?(?:; boundary=(?:(?:"(.+)")|(?:([^\s]+))))$/i.exec(contentType)
+    const m = /^multipart\/.+?\s*;\s*boundary=(?:"([^"]+)"|([^\s";]+))\s*$/i.exec(contentType)
     if (m == null) {
       reject(new Error(`Content-Type "multipart/byteranges" is expected, but got "${contentType}"`))
       return
     }
 
-    const dicer = new DataSplitter(out, options, partIndexToTaskIndex, m[1] || m[2], partIndexToLength, resolve)
+    // The watchdog below only exists for a response that ends before every part was handled. It must not outlive a
+    // successful batch: the next batch reuses the same `reject`, so a stale watchdog used to fail any multi-batch
+    // download whose later batches took longer than the grace period.
+    let isBatchFinished = false
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const onBatchFinished = (): void => {
+      isBatchFinished = true
+      if (watchdog != null) {
+        clearTimeout(watchdog)
+        watchdog = null
+      }
+      resolve()
+    }
+
+    const dicer = new DataSplitter(
+      out,
+      options,
+      partIndexToTaskIndex,
+      m[1] || m[2],
+      partIndexToLength,
+      onBatchFinished,
+      grandTotalBytes,
+      differentialDownloader.options.onProgress,
+      differentialDownloader.logger
+    )
     dicer.on("error", reject)
     response.pipe(dicer)
 
     response.on("end", () => {
-      setTimeout(() => {
+      if (isBatchFinished) {
+        return
+      }
+      watchdog = setTimeout(() => {
+        watchdog = null
+        if (isBatchFinished) {
+          return
+        }
         request.abort()
         reject(new Error("Response ends without calling any handlers"))
       }, 10000)

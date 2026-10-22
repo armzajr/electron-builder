@@ -1,15 +1,17 @@
 import { BlockMapDataHolder, createHttpError, DigestTransform, HttpExecutor, configureRequestUrl, configureRequestOptions } from "builder-util-runtime"
-import { BlockMap } from "builder-util-runtime/out/blockMapApi"
-import { close, open } from "fs-extra"
+import { BlockMap } from "builder-util-runtime"
+import { detectSha512Encoding } from "builder-util-runtime/internal"
+import fsExtra from "fs-extra"
 import { createWriteStream } from "fs"
 import { OutgoingHttpHeaders, RequestOptions } from "http"
 import { ProgressInfo, CancellationToken } from "builder-util-runtime"
-import { Logger } from "../main"
-import { copyData } from "./DataSplitter"
+import { Logger } from "../types.js"
+import { nonThrowingLogger } from "../util.js"
+import { copyData } from "./DataSplitter.js"
 import { URL } from "url"
-import { computeOperations, Operation, OperationKind } from "./downloadPlanBuilder"
-import { checkIsRangesSupported, executeTasksUsingMultipleRangeRequests } from "./multipleRangeDownloader"
-import { ProgressDifferentialDownloadCallbackTransform, ProgressDifferentialDownloadInfo } from "./ProgressDifferentialDownloadCallbackTransform"
+import { computeOperations, Operation, OperationKind } from "./downloadPlanBuilder.js"
+import { checkIsRangesSupported, executeTasksUsingMultipleRangeRequests } from "./multipleRangeDownloader.js"
+import { ProgressDifferentialDownloadCallbackTransform, ProgressDifferentialDownloadInfo } from "./ProgressDifferentialDownloadCallbackTransform.js"
 
 export interface DifferentialDownloaderOptions {
   readonly oldFile: string
@@ -28,11 +30,16 @@ export interface DifferentialDownloaderOptions {
 export abstract class DifferentialDownloader {
   fileMetadataBuffer: Buffer | null = null
 
-  private readonly logger: Logger
+  readonly logger: Logger
 
   // noinspection TypeScriptAbstractClassConstructorCanBeMadeProtected
-  constructor(protected readonly blockAwareFileInfo: BlockMapDataHolder, readonly httpExecutor: HttpExecutor<any>, readonly options: DifferentialDownloaderOptions) {
-    this.logger = options.logger
+  constructor(
+    protected readonly blockAwareFileInfo: BlockMapDataHolder,
+    readonly httpExecutor: HttpExecutor<any>,
+    readonly options: DifferentialDownloaderOptions
+  ) {
+    // logging runs in stream and response callbacks, where a throwing logger would escape as an uncaught exception
+    this.logger = nonThrowingLogger(options.logger)
   }
 
   createRequestOptions(): RequestOptions {
@@ -86,7 +93,7 @@ export abstract class DifferentialDownloader {
     const closeFiles = (): Promise<Array<void>> => {
       return Promise.all(
         fdList.map(openedFile => {
-          return close(openedFile.descriptor).catch(e => {
+          return fsExtra.close(openedFile.descriptor).catch((e: any) => {
             this.logger.error(`cannot close file "${openedFile.path}": ${e}`)
           })
         })
@@ -94,7 +101,7 @@ export abstract class DifferentialDownloader {
     }
     return this.doDownloadFile(tasks, fdList)
       .then(closeFiles)
-      .catch(e => {
+      .catch((e: any) => {
         // then must be after catch here (since then always throws error)
         return closeFiles()
           .catch(closeFilesError => {
@@ -104,7 +111,7 @@ export abstract class DifferentialDownloader {
             } catch (errorOnLog) {
               try {
                 console.error(errorOnLog)
-              } catch (ignored) {
+              } catch (_ignored) {
                 // ok, give up and ignore error
               }
             }
@@ -117,9 +124,9 @@ export abstract class DifferentialDownloader {
   }
 
   private async doDownloadFile(tasks: Array<Operation>, fdList: Array<OpenedFile>): Promise<any> {
-    const oldFileFd = await open(this.options.oldFile, "r")
+    const oldFileFd = await fsExtra.open(this.options.oldFile, "r")
     fdList.push({ descriptor: oldFileFd, path: this.options.oldFile })
-    const newFileFd = await open(this.options.newFile, "w")
+    const newFileFd = await fsExtra.open(this.options.newFile, "w")
     fdList.push({ descriptor: newFileFd, path: this.options.newFile })
     const fileOut = createWriteStream(this.options.newFile, { fd: newFileFd })
     await new Promise((resolve, reject) => {
@@ -128,7 +135,6 @@ export abstract class DifferentialDownloader {
       // Create our download info transformer if we have one
       let downloadInfoTransform: ProgressDifferentialDownloadCallbackTransform | undefined = undefined
       if (!this.options.isUseMultipleRangeRequest && this.options.onProgress) {
-        // TODO: Does not support multiple ranges (someone feel free to PR this!)
         const expectedByteCounts: Array<number> = []
         let grandTotalBytes = 0
 
@@ -148,7 +154,9 @@ export abstract class DifferentialDownloader {
         streams.push(downloadInfoTransform)
       }
 
-      const digestTransform = new DigestTransform(this.blockAwareFileInfo.sha512)
+      // like the full download, accept the legacy hex encoding of the manifest's sha512
+      const sha512 = this.blockAwareFileInfo.sha512
+      const digestTransform = new DigestTransform(sha512, "sha512", detectSha512Encoding(sha512))
       // to simply debug, do manual validation to allow file to be fully written
       digestTransform.isValidateOnEnd = false
       streams.push(digestTransform)
@@ -160,7 +168,7 @@ export abstract class DifferentialDownloader {
           fdList.splice(1, 1)
           try {
             digestTransform.validate()
-          } catch (e) {
+          } catch (e: any) {
             reject(e)
             return
           }
@@ -228,6 +236,10 @@ export abstract class DifferentialDownloader {
         }
 
         const request = this.httpExecutor.createRequest(requestOptions, response => {
+          response.on("error", reject)
+          response.on("aborted", () => {
+            reject(new Error("response has been aborted by the server"))
+          })
           // Electron net handles redirects automatically, our NodeJS test server doesn't use redirects - so, we don't check 3xx codes.
           if (response.statusCode >= 400) {
             reject(createHttpError(response))
@@ -286,6 +298,11 @@ export abstract class DifferentialDownloader {
         if (!checkIsRangesSupported(response, reject)) {
           return
         }
+
+        response.on("error", reject)
+        response.on("aborted", () => {
+          reject(new Error("response has been aborted by the server"))
+        })
 
         response.on("data", dataHandler)
         response.on("end", () => resolve())

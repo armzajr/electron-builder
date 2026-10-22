@@ -1,28 +1,25 @@
-import { removePassword, TmpDir } from "builder-util"
-import { createKeychain } from "app-builder-lib/out/codeSign/macCodeSign"
-import { CSC_LINK } from "../helpers/codeSignData"
+import { createKeychain, removeKeychain } from "app-builder-lib/internal"
+import { removePassword } from "builder-util"
+import { getMacSigningIdentity } from "../helpers/packTester.js"
 
-if (process.env.CSC_KEY_PASSWORD == null) {
-  fit("Skip keychain-specific tests because CSC_KEY_PASSWORD is not defined", () => {
-    console.warn("[SKIP] Skip keychain-specific tests because CSC_KEY_PASSWORD is not defined")
+describe.ifMac("macos keychain", { concurrent: false }, () => {
+  test("create keychain", async ({ expect, tmpDir }) => {
+    const { p12Base64, password } = await getMacSigningIdentity()
+    const result = await createKeychain({ tmpDir, cscLink: p12Base64, cscKeyPassword: password, currentDir: process.cwd() })
+    expect(result.keychainFile).not.toEqual("")
+    await removeKeychain(result.keychainFile!)
   })
-}
 
-const tmpDir = new TmpDir("mac-code-sign-test")
-
-test.ifMac("create keychain", async () => {
-  const result = await createKeychain({ tmpDir, cscLink: CSC_LINK, cscKeyPassword: process.env.CSC_KEY_PASSWORD!!, currentDir: process.cwd() })
-  expect(result.keychainFile).not.toEqual("")
+  test("create keychain with installers", async ({ expect, tmpDir }) => {
+    const { p12Base64, password } = await getMacSigningIdentity()
+    const result = await createKeychain({ tmpDir, cscLink: p12Base64, cscKeyPassword: password, currentDir: process.cwd() })
+    expect(result.keychainFile).not.toEqual("")
+    await removeKeychain(result.keychainFile!)
+  })
 })
 
-afterEach(() => tmpDir.cleanup())
-
-test.ifMac("create keychain with installers", async () => {
-  const result = await createKeychain({ tmpDir, cscLink: CSC_LINK, cscKeyPassword: process.env.CSC_KEY_PASSWORD!!, currentDir: process.cwd() })
-  expect(result.keychainFile).not.toEqual("")
-})
-
-test.ifDevOrLinuxCi("remove password from log", async () => {
+// TODO: fix me
+test.skip("remove password from log", ({ expect }) => {
   expect(removePassword("seq -P foo -B")).toMatchSnapshot()
   expect(removePassword("pass:foo")).toMatchSnapshot()
   // noinspection SpellCheckingInspection

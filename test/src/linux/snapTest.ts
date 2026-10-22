@@ -1,32 +1,32 @@
 import { Arch, Platform } from "electron-builder"
-import { app, assertPack, snapTarget } from "../helpers/packTester"
+import * as path from "path"
+import { readSquashfsCompression } from "../helpers/fileAssert.js"
+import { app, appThrows, assertPack, snapTarget } from "../helpers/packTester.js"
 
-if (process.env.SNAP_TEST === "false") {
-  fit("Skip snapTest suite — SNAP_TEST is set to false or Windows", () => {
-    console.warn("[SKIP] Skip snapTest suite — SNAP_TEST is set to false")
-  })
-} else if (process.platform === "win32") {
-  fit("Skip snapTest suite — Windows is not supported", () => {
-    console.warn("[SKIP] Skip snapTest suite — Windows is not supported")
-  })
-}
-
-test.ifAll.ifDevOrLinuxCi(
-  "snap",
-  app({
+test.ifNotWindows("snap", ({ expect }) =>
+  app(expect, {
     targets: snapTarget,
     config: {
       extraMetadata: {
         name: "sep",
       },
       productName: "Sep",
+      electronFuses: {
+        runAsNode: true,
+        enableCookieEncryption: true,
+        enableNodeOptionsEnvironmentVariable: true,
+        enableNodeCliInspectArguments: true,
+        enableEmbeddedAsarIntegrityValidation: true,
+        onlyLoadAppFromAsar: true,
+        loadBrowserProcessSpecificV8Snapshot: true,
+        grantFileProtocolExtraPrivileges: undefined, // unsupported on current electron version in our tests
+      },
     },
   })
 )
 
-test.ifAll.ifDevOrLinuxCi(
-  "arm",
-  app({
+test.ifNotWindows("arm", ({ expect }) =>
+  app(expect, {
     targets: Platform.LINUX.createTarget("snap", Arch.armv7l),
     config: {
       extraMetadata: {
@@ -37,72 +37,80 @@ test.ifAll.ifDevOrLinuxCi(
   })
 )
 
-test.ifAll.ifDevOrLinuxCi("default stagePackages", async () => {
+test.ifNotWindows("default stagePackages", async ({ expect }) => {
   for (const p of [["default"], ["default", "custom"], ["custom", "default"], ["foo1", "default", "foo2"]]) {
-    await assertPack("test-app-one", {
-      targets: Platform.LINUX.createTarget("snap"),
+    await assertPack(expect, "test-app-one", {
+      targets: snapTarget,
       config: {
         extraMetadata: {
           name: "sep",
         },
         productName: "Sep",
-        snap: {
-          stagePackages: p,
-          plugs: p,
-          confinement: "classic",
-          // otherwise "parts" will be removed
-          useTemplateApp: false,
+        snapcraft: {
+          base: "core20",
+          core20: {
+            stagePackages: p,
+            plugs: p,
+            confinement: "classic",
+            // otherwise "parts" will be removed
+            useTemplateApp: false,
+          },
         },
       },
       effectiveOptionComputed: async ({ snap, args }) => {
         delete snap.parts.app.source
         expect(snap).toMatchSnapshot()
         expect(args).not.toContain("--exclude")
-        return true
+        return Promise.resolve(true)
       },
     })
   }
 })
 
-test.ifAll.ifDevOrLinuxCi(
-  "classic confinement",
-  app({
+test.ifNotWindows("classic confinement", ({ expect }) =>
+  app(expect, {
     targets: snapTarget,
     config: {
       extraMetadata: {
         name: "cl-co-app",
       },
       productName: "Snap Electron App (classic confinement)",
-      snap: {
-        confinement: "classic",
+      snapcraft: {
+        base: "core20",
+        core20: {
+          confinement: "classic",
+        },
       },
     },
   })
 )
 
-test.ifAll.ifDevOrLinuxCi("buildPackages", async () => {
-  await assertPack("test-app-one", {
-    targets: Platform.LINUX.createTarget("snap"),
+test.ifNotWindows("buildPackages", async ({ expect }) => {
+  await assertPack(expect, "test-app-one", {
+    targets: snapTarget,
     config: {
       extraMetadata: {
         name: "sep",
       },
       productName: "Sep",
-      snap: {
-        buildPackages: ["foo1", "default", "foo2"],
-        // otherwise "parts" will be removed
-        useTemplateApp: false,
+      snapcraft: {
+        base: "core20",
+        core20: {
+          buildPackages: ["foo1", "default", "foo2"],
+          // otherwise "parts" will be removed
+          useTemplateApp: false,
+        },
       },
     },
     effectiveOptionComputed: async ({ snap }) => {
       delete snap.parts.app.source
       expect(snap).toMatchSnapshot()
-      return true
+      return Promise.resolve(true)
     },
   })
 })
 
-test.ifDevOrLinuxCi("plugs option", async () => {
+test.ifNotWindows("plugs option", async ({ expect }) => {
   for (const p of [
     [
       {
@@ -121,26 +129,29 @@ test.ifDevOrLinuxCi("plugs option", async () => {
       "another-simple-plug-name": null,
     },
   ]) {
-    await assertPack("test-app-one", {
-      targets: Platform.LINUX.createTarget("snap"),
+    await assertPack(expect, "test-app-one", {
+      targets: snapTarget,
       config: {
-        snap: {
-          plugs: p,
-          // otherwise "parts" will be removed
-          useTemplateApp: false,
+        snapcraft: {
+          base: "core20",
+          core20: {
+            plugs: p,
+            // otherwise "parts" will be removed
+            useTemplateApp: false,
+          },
         },
       },
       effectiveOptionComputed: async ({ snap, args }) => {
         delete snap.parts.app.source
         expect(snap).toMatchSnapshot()
         expect(args).not.toContain("--exclude")
-        return true
+        return Promise.resolve(true)
       },
     })
   }
 })
 
-test.ifDevOrLinuxCi("slots option", async () => {
+test.ifNotWindows("slots option", async ({ expect }) => {
   for (const slots of [
     ["foo", "bar"],
     [
@@ -153,105 +164,270 @@ test.ifDevOrLinuxCi("slots option", async () => {
       "another-simple-slot-name",
     ],
   ]) {
-    await assertPack("test-app-one", {
-      targets: Platform.LINUX.createTarget("snap"),
+    await assertPack(expect, "test-app-one", {
+      targets: snapTarget,
       config: {
         extraMetadata: {
           name: "sep",
         },
         productName: "Sep",
-        snap: {
-          slots,
+        snapcraft: {
+          base: "core20",
+          core20: {
+            slots,
+          },
         },
       },
-      effectiveOptionComputed: async ({ snap, args }) => {
+      effectiveOptionComputed: async ({ snap }) => {
         expect(snap).toMatchSnapshot()
-        return true
+        return Promise.resolve(true)
       },
     })
   }
 })
 
-test.ifDevOrLinuxCi(
-  "custom env",
-  app({
-    targets: Platform.LINUX.createTarget("snap"),
-    config: {
-      extraMetadata: {
-        name: "sep",
-      },
-      productName: "Sep",
-      snap: {
-        environment: {
-          FOO: "bar",
-        },
-      },
-    },
-    effectiveOptionComputed: async ({ snap }) => {
-      expect(snap).toMatchSnapshot()
-      return true
-    },
-  })
-)
-
-test.ifDevOrLinuxCi(
-  "custom after, no desktop",
-  app({
-    targets: Platform.LINUX.createTarget("snap"),
-    config: {
-      extraMetadata: {
-        name: "sep",
-      },
-      productName: "Sep",
-      snap: {
-        after: ["bar"],
-      },
-    },
-    effectiveOptionComputed: async ({ snap }) => {
-      expect(snap).toMatchSnapshot()
-      return true
-    },
-  })
-)
-
-test.ifDevOrLinuxCi(
-  "no desktop plugs",
-  app({
-    targets: Platform.LINUX.createTarget("snap"),
-    config: {
-      extraMetadata: {
-        name: "sep",
-      },
-      productName: "Sep",
-      snap: {
-        plugs: ["foo", "bar"],
-      },
-    },
-    effectiveOptionComputed: async ({ snap, args }) => {
-      expect(snap).toMatchSnapshot()
-      expect(args).toContain("--exclude")
-      return true
-    },
-  })
-)
-
-test.ifAll.ifDevOrLinuxCi(
-  "auto start",
-  app({
+test.ifNotWindows("custom env", ({ expect }) =>
+  app(expect, {
     targets: snapTarget,
     config: {
       extraMetadata: {
         name: "sep",
       },
       productName: "Sep",
-      snap: {
-        autoStart: true,
+      snapcraft: {
+        base: "core20",
+        core20: {
+          environment: {
+            FOO: "bar",
+          },
+        },
+      },
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("custom after, no desktop", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      extraMetadata: {
+        name: "sep",
+      },
+      productName: "Sep",
+      snapcraft: {
+        base: "core20",
+        core20: {
+          after: ["bar"],
+        },
+      },
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("no desktop plugs", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      extraMetadata: {
+        name: "sep",
+      },
+      productName: "Sep",
+      snapcraft: {
+        base: "core20",
+        core20: {
+          plugs: ["foo", "bar"],
+        },
       },
     },
     effectiveOptionComputed: async ({ snap, args }) => {
       expect(snap).toMatchSnapshot()
-      expect(snap.apps.sep.autostart).toEqual("sep.desktop")
-      return true
+      expect(args).toContain("--exclude")
+      return Promise.resolve(true)
     },
   })
+)
+
+test.ifNotWindows("auto start", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      extraMetadata: {
+        name: "sep",
+      },
+      productName: "Sep",
+      snapcraft: {
+        base: "core20",
+        core20: {
+          autoStart: true,
+        },
+      },
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      expect(snap.apps.sep.autostart).toEqual("sep.desktop")
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("default compression", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      extraMetadata: {
+        name: "sep",
+      },
+      productName: "Sep",
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("compression option", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      extraMetadata: {
+        name: "sep",
+      },
+      productName: "Sep",
+      snapcraft: {
+        base: "core20",
+        core20: {
+          useTemplateApp: false,
+          compression: "xz",
+        },
+      },
+    },
+    effectiveOptionComputed: async ({ snap, args }) => {
+      expect(snap).toMatchSnapshot()
+      expect(snap.compression).toBe("xz")
+      expect(args).toEqual(expect.arrayContaining(["--compression", "xz"]))
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("default base", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      productName: "Sep",
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      expect(snap.base).toBe("core20")
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("base option", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      productName: "Sep",
+      snapcraft: {
+        base: "core22",
+      },
+    },
+    effectiveOptionComputed: async ({ snap }) => {
+      expect(snap).toMatchSnapshot()
+      expect(snap.base).toBe("core22")
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("use template app", ({ expect }) =>
+  app(expect, {
+    targets: snapTarget,
+    config: {
+      snapcraft: {
+        base: "core20",
+        core20: {
+          useTemplateApp: true,
+          compression: "xz",
+        },
+      },
+    },
+    effectiveOptionComputed: async ({ snap, args }) => {
+      expect(snap).toMatchSnapshot()
+      expect(snap.parts).toBeUndefined()
+      expect(snap.compression).toBeUndefined()
+      expect(snap.contact).toBeUndefined()
+      expect(snap.donation).toBeUndefined()
+      expect(snap.issues).toBeUndefined()
+      expect(snap.parts).toBeUndefined()
+      expect(snap["source-code"]).toBeUndefined()
+      expect(snap.website).toBeUndefined()
+      expect(args).toEqual(expect.arrayContaining(["--exclude", "chrome-sandbox", "--compression", "xz"]))
+      return Promise.resolve(true)
+    },
+  })
+)
+
+test.ifNotWindows("template app with lzo compression (#7013)", ({ expect }) =>
+  app(
+    expect,
+    {
+      targets: snapTarget,
+      config: {
+        extraMetadata: {
+          name: "sep",
+        },
+        productName: "Sep",
+        snapcraft: {
+          base: "core20",
+          core20: {
+            useTemplateApp: true,
+            compression: "lzo",
+          },
+        },
+      },
+    },
+    {
+      packed: async context => {
+        // Template builds pack with toolsets.appimage's mksquashfs; the legacy "0.0.0" one supported only gzip/xz.
+        expect(await readSquashfsCompression(path.join(context.outDir, "sep_1.1.0_amd64.snap"))).toBe("lzo")
+      },
+    }
+  )
+)
+
+test.ifNotWindows("template app honors toolsets.appimage pin", ({ expect }) =>
+  appThrows(
+    expect,
+    {
+      targets: snapTarget,
+      config: {
+        extraMetadata: {
+          name: "sep",
+        },
+        productName: "Sep",
+        toolsets: { appimage: "0.0.0" },
+        snapcraft: {
+          base: "core20",
+          core20: {
+            useTemplateApp: true,
+            compression: "lzo",
+          },
+        },
+      },
+    },
+    {},
+    // The pinned legacy "0.0.0" mksquashfs supports only gzip/xz, so the pin reaching the template build is rejected up front.
+    error => expect(error.message).toContain('Snap compression "lzo" is not supported with toolsets.appimage "0.0.0"')
+  )
 )

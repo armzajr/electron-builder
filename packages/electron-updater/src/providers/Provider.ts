@@ -1,9 +1,11 @@
-import { CancellationToken, HttpExecutor, newError, safeStringifyJson, UpdateFileInfo, UpdateInfo, WindowsUpdateInfo, configureRequestUrl } from "builder-util-runtime"
+import { CancellationToken, configureRequestUrl, newError, safeStringifyJson, UpdateFileInfo, UpdateInfo, WindowsUpdateInfo } from "builder-util-runtime"
 import { OutgoingHttpHeaders, RequestOptions } from "http"
 import { load } from "js-yaml"
 import { URL } from "url"
-import { ResolvedUpdateFileInfo } from "../main"
-import { newUrlFromBase } from "../util"
+import { ElectronHttpExecutor } from "../electronHttpExecutor.js"
+import { ResolvedUpdateFileInfo } from "../types.js"
+import { newUrlFromBase } from "../util.js"
+import escapeRegExp from "lodash.escaperegexp"
 
 export type ProviderPlatform = "darwin" | "linux" | "win32"
 
@@ -11,15 +13,32 @@ export interface ProviderRuntimeOptions {
   isUseMultipleRangeRequest: boolean
   platform: ProviderPlatform
 
-  executor: HttpExecutor<any>
+  executor: ElectronHttpExecutor
+}
+
+// Shared by the GitHub/GitLab/PrivateGitHub providers when a release channel file (e.g. latest.yml) 404s.
+export function channelFileNotFoundError(channelFile: string, channelFileUrl: URL | string, e: any): Error {
+  return newError(`Cannot find ${channelFile} in the latest release artifacts (${channelFileUrl}): ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
 }
 
 export abstract class Provider<T extends UpdateInfo> {
   private requestHeaders: OutgoingHttpHeaders | null = null
-  protected readonly executor: HttpExecutor<any>
+  protected readonly executor: ElectronHttpExecutor
 
   protected constructor(private readonly runtimeOptions: ProviderRuntimeOptions) {
     this.executor = runtimeOptions.executor
+  }
+
+  // By default, the blockmap file is in the same directory as the main file
+  // But some providers may have a different blockmap file, so we need to override this method
+  getBlockMapFiles(baseUrl: URL, oldVersion: string, newVersion: string, oldBlockMapFileBaseUrl: string | null = null): URL[] | Promise<URL[]> {
+    const newBlockMapUrl = newUrlFromBase(`${baseUrl.pathname}.blockmap`, baseUrl)
+    const oldBlockMapUrl = newUrlFromBase(
+      `${baseUrl.pathname.replace(new RegExp(escapeRegExp(newVersion), "g"), oldVersion)}.blockmap`,
+      oldBlockMapFileBaseUrl ? new URL(oldBlockMapFileBaseUrl) : baseUrl
+    )
+
+    return [oldBlockMapUrl, newBlockMapUrl]
   }
 
   get isUseMultipleRangeRequest(): boolean {
@@ -28,7 +47,7 @@ export abstract class Provider<T extends UpdateInfo> {
 
   private getChannelFilePrefix(): string {
     if (this.runtimeOptions.platform === "linux") {
-      const arch = process.env.TEST_UPDATER_ARCH || process.arch
+      const arch = process.env["TEST_UPDATER_ARCH"] || process.arch
       const archSuffix = arch === "x64" ? "" : `-${arch}`
       return "-linux" + archSuffix
     } else {
@@ -49,13 +68,23 @@ export abstract class Provider<T extends UpdateInfo> {
     return null
   }
 
+  /**
+   * Base URL of the update feed: the credential-bearing request headers (the ones stripped on a cross-origin redirect) are only sent to
+   * download URLs on its origin. `null` sends the request headers to every download URL.
+   * The default, `undefined`, means not declared: a download with credential headers (from `requestHeaders` / `addAuthHeader`) then fails
+   * with `ERR_UPDATER_FEED_BASE_URL_NOT_DECLARED`, so a custom provider used with credentials must override this getter.
+   */
+  get feedBaseUrl(): URL | null | undefined {
+    return undefined
+  }
+
   setRequestHeaders(value: OutgoingHttpHeaders | null): void {
     this.requestHeaders = value
   }
 
   abstract getLatestVersion(): Promise<T>
 
-  abstract resolveFiles(updateInfo: UpdateInfo): Array<ResolvedUpdateFileInfo>
+  abstract resolveFiles(updateInfo: T): Array<ResolvedUpdateFileInfo>
 
   /**
    * Method to perform API request only to resolve update info, but not to download update.
@@ -84,13 +113,15 @@ export function findFile(files: Array<ResolvedUpdateFileInfo>, extension: string
     throw newError("No files provided", "ERR_UPDATER_NO_FILES_PROVIDED")
   }
 
-  const result = files.find(it => it.url.pathname.toLowerCase().endsWith(`.${extension}`))
-  if (result != null) {
+  const filteredFiles = files.filter(it => it.url.pathname.toLowerCase().endsWith(`.${extension.toLowerCase()}`))
+  const result = filteredFiles.find(it => [it.url.pathname, it.info.url].some(n => n.includes(process.arch))) ?? filteredFiles.shift()
+
+  if (result) {
     return result
   } else if (not == null) {
     return files[0]
   } else {
-    return files.find(fileInfo => !not.some(ext => fileInfo.url.pathname.toLowerCase().endsWith(`.${ext}`)))
+    return files.find(fileInfo => !not.some(ext => fileInfo.url.pathname.toLowerCase().endsWith(`.${ext.toLowerCase()}`)))
   }
 }
 
@@ -102,7 +133,7 @@ export function parseUpdateInfo(rawData: string | null, channelFile: string, cha
   let result: UpdateInfo
   try {
     result = load(rawData) as UpdateInfo
-  } catch (e) {
+  } catch (e: any) {
     throw newError(
       `Cannot parse update info from ${channelFile} in the latest release artifacts (${channelFileUrl}): ${e.stack || e.message}, rawData: ${rawData}`,
       "ERR_UPDATER_INVALID_UPDATE_INFO"
@@ -132,6 +163,12 @@ export function getFileList(updateInfo: UpdateInfo): Array<UpdateFileInfo> {
   }
 }
 
+// An absolute blockMapUrl (e.g. a separately pre-signed URL) is used as-is: a provider's path transformer (such as GitHub's release
+// download path) only applies to a relative one, which resolves against the feed like `url`.
+function resolveBlockMapUrl(blockMapUrl: string, baseUrl: URL, pathTransformer: (p: string) => string): URL {
+  return newUrlFromBase(/^[a-z][a-z\d+.-]*:/i.test(blockMapUrl) ? blockMapUrl : pathTransformer(blockMapUrl), baseUrl)
+}
+
 export function resolveFiles(updateInfo: UpdateInfo, baseUrl: URL, pathTransformer: (p: string) => string = (p: string): string => p): Array<ResolvedUpdateFileInfo> {
   const files = getFileList(updateInfo)
   const result: Array<ResolvedUpdateFileInfo> = files.map(fileInfo => {
@@ -141,6 +178,7 @@ export function resolveFiles(updateInfo: UpdateInfo, baseUrl: URL, pathTransform
     return {
       url: newUrlFromBase(pathTransformer(fileInfo.url), baseUrl),
       info: fileInfo,
+      ...(fileInfo.blockMapUrl == null ? {} : { blockMapUrl: resolveBlockMapUrl(fileInfo.blockMapUrl, baseUrl, pathTransformer) }),
     }
   })
 

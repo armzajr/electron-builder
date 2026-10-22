@@ -1,0 +1,153 @@
+#! /usr/bin/env node
+
+import { fileURLToPath } from "node:url"
+import { AppInfo, CancellationToken, Packager, PackagerOptions, PublishManager, PublishOptions, UploadTask, checkBuildRequestOptions } from "app-builder-lib"
+import { Publish, computeSafeArtifactNameIfNeeded, getConfig } from "app-builder-lib/internal"
+import { InvalidConfigurationError, archFromString, log, printErrorAndExit } from "builder-util"
+import type { PublishPolicy } from "electron-publish"
+import chalk from "chalk"
+import * as path from "path"
+import { Argv } from "yargs"
+import { BuildOptions, createYargs, normalizeOptions } from "./builder.js"
+
+/** @internal */
+export function configurePublishCommand(yargs: Argv): Argv {
+  // https://github.com/yargs/yargs/issues/760
+  // demandOption is required to be set
+  return yargs
+    .version(false)
+    .parserConfiguration({
+      "camel-case-expansion": false,
+    })
+    .option("files", {
+      alias: "f",
+      string: true,
+      type: "array",
+      requiresArg: true,
+      description: "The file(s) to upload to your publisher",
+    })
+    .option("version", {
+      alias: ["v"],
+      type: "string",
+      description: "The app/build version used when searching for an upload release (used by some Publishers)",
+    })
+    .option("config", {
+      alias: ["c", "configurationFilePath"],
+      type: "string",
+      description:
+        "The path to an electron-builder config. Defaults to `electron-builder.yml` (or `json`, or `json5`, or `js`, or `ts`), see " + chalk.underline("https://goo.gl/YFRJOM"),
+    })
+    .option("policy", {
+      alias: ["p"],
+      type: "string",
+      description: `Publish trigger policy, see ${chalk.underline("https://www.electron.build/publish")}`,
+      choices: ["onTag", "onTagOrDraft", "always", "never", undefined as any],
+    })
+    .demandOption("files")
+}
+
+export async function publish(args: { files: string[]; version: string | undefined; configurationFilePath: string | undefined; policy: PublishPolicy }) {
+  const uploadTasks = args.files.map(f => {
+    return {
+      file: path.resolve(f),
+      arch: null,
+    }
+  })
+  return publishArtifactsWithOptions(uploadTasks, args.version, args.configurationFilePath, undefined, { publish: args.policy })
+}
+
+export async function publishArtifactsWithOptions(
+  uploadOptions: { file: string; arch: string | null }[],
+  buildVersion?: string,
+  configurationFilePath?: string,
+  publishConfiguration?: Publish,
+  publishOptions?: PublishOptions
+) {
+  const projectDir = process.cwd()
+  const config = await getConfig(projectDir, configurationFilePath || null, { publish: publishConfiguration, detectUpdateChannel: false })
+
+  const buildOptions: BuildOptions = normalizeOptions({ config, publish: publishOptions?.publish })
+  checkBuildRequestOptions(buildOptions)
+
+  const tasks = createUploadTasks(uploadOptions)
+
+  return publishPackageWithTasks(buildOptions, tasks, buildVersion)
+}
+
+/** @internal */
+export function createUploadTasks(uploadOptions: { file: string; arch: string | null }[]): UploadTask[] {
+  const seen = new Set<string>()
+  return uploadOptions
+    .filter(({ file, arch }) => {
+      const key = `${file}\0${arch ?? ""}`
+      if (seen.has(key)) {
+        return false
+      }
+      seen.add(key)
+      return true
+    })
+    .map(({ file, arch }) => {
+      const filename = path.basename(file)
+      return { file, arch: arch ? archFromString(arch) : null, safeArtifactName: computeSafeArtifactNameIfNeeded(filename, () => filename) }
+    })
+}
+
+async function publishPackageWithTasks(
+  options: PackagerOptions & PublishOptions,
+  uploadTasks: UploadTask[],
+  buildVersion?: string,
+  cancellationToken: CancellationToken = new CancellationToken(),
+  packager: Packager = new Packager(options, cancellationToken)
+) {
+  await packager.validateConfig()
+  const appInfo = new AppInfo(packager, buildVersion)
+  const publishManager = new PublishManager(packager, options, cancellationToken)
+
+  const sigIntHandler = () => {
+    log.warn("cancelled by SIGINT")
+    packager.cancellationToken.cancel()
+    publishManager.cancelTasks()
+  }
+
+  return withPublishSigIntHandler(sigIntHandler, async () => {
+    try {
+      const publishConfigurations = await publishManager.getGlobalPublishConfigurations()
+      if (publishConfigurations == null || publishConfigurations.length === 0) {
+        throw new InvalidConfigurationError("unable to find any publish configuration")
+      }
+
+      for (const newArtifact of uploadTasks) {
+        for (const publishConfiguration of publishConfigurations) {
+          await publishManager.scheduleUpload(publishConfiguration, newArtifact, appInfo)
+        }
+      }
+
+      await publishManager.awaitTasks()
+      return uploadTasks
+    } catch (error: any) {
+      packager.cancellationToken.cancel()
+      publishManager.cancelTasks()
+      log.error({ message: (error.stack || error.message || error).toString() }, "error publishing")
+      return null
+    }
+  })
+}
+
+/** @internal */
+export async function withPublishSigIntHandler<T>(handler: () => void, task: () => Promise<T>): Promise<T> {
+  process.once("SIGINT", handler)
+  try {
+    return await task()
+  } finally {
+    process.removeListener("SIGINT", handler)
+  }
+}
+
+function main() {
+  return publish(configurePublishCommand(createYargs()).argv as any)
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  log.warn("please use as subcommand: electron-builder publish")
+  main().catch(printErrorAndExit)
+}

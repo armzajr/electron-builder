@@ -1,6 +1,7 @@
-import { exec, spawn, DebugLogger, ExtraSpawnOptions, log } from "builder-util"
-import { SpawnOptions, execFileSync, ExecFileOptions } from "child_process"
-import { VmManager } from "./vm"
+import { DebugLogger, ExtraSpawnOptions, exec, log, sanitizeDirPath, spawn, stripSensitiveEnvVars } from "builder-util"
+import { ExecFileOptions, SpawnOptions, execFileSync } from "child_process"
+import { homedir } from "os"
+import { VmManager } from "./vm.js"
 
 /** @internal */
 export async function parseVmList(debugLogger: DebugLogger) {
@@ -33,7 +34,6 @@ export async function parseVmList(debugLogger: DebugLogger) {
   return result
 }
 
-/** @internal */
 export class ParallelsVmManager extends VmManager {
   private startPromise: Promise<any>
 
@@ -60,8 +60,10 @@ export class ParallelsVmManager extends VmManager {
 
   async exec(file: string, args: Array<string>, options?: ExecFileOptions): Promise<string> {
     await this.ensureThatVmStarted()
+    // Merge caller-supplied env onto the base environment, so extra vars don't strip PATH and `prlctl` itself stays resolvable.
+    const mergedOptions = options?.env != null ? { ...options, env: { ...stripSensitiveEnvVars(process.env), ...options.env } } : options
     // it is important to use "--current-user" to execute command under logged in user - to access certs.
-    return await exec("prlctl", ["exec", this.vm.id, "--current-user", file.startsWith("/") ? macPathToParallelsWindows(file) : file].concat(args), options).catch(error =>
+    return await exec("prlctl", ["exec", this.vm.id, "--current-user", file.startsWith("/") ? macPathToParallelsWindows(file) : file].concat(args), mergedOptions).catch(error =>
       this.handleExecuteError(error)
     )
   }
@@ -80,15 +82,25 @@ export class ParallelsVmManager extends VmManager {
 
     if (!this.isExitHookAdded) {
       this.isExitHookAdded = true
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      require("async-exit-hook")((callback: (() => void) | null) => {
-        const stopArgs = ["suspend", vmId]
-        if (callback == null) {
+      const stopArgs = ["suspend", vmId]
+      // Suspend the VM on normal exit and on termination signals.
+      // SIGTERM/SIGINT use async exec(); the synchronous 'exit' fallback fires
+      // after all async callbacks have already resolved, so execFileSync is safe.
+      const suspendAsync = () => exec("prlctl", stopArgs).catch(() => {})
+      const suspendSync = () => {
+        try {
           execFileSync("prlctl", stopArgs)
-        } else {
-          exec("prlctl", stopArgs).then(callback).catch(callback)
+        } catch {
+          /* best-effort */
         }
+      }
+      process.once("SIGTERM", () => {
+        void suspendAsync()
       })
+      process.once("SIGINT", () => {
+        void suspendAsync()
+      })
+      process.once("exit", suspendSync)
     }
     await exec("prlctl", ["start", vmId])
   }
@@ -112,12 +124,35 @@ export function macPathToParallelsWindows(file: string) {
   if (file.startsWith("C:\\")) {
     return file
   }
-  return "\\\\Mac\\Host\\" + file.replace(/\//g, "\\")
+  if (!file.startsWith("/")) {
+    throw new Error(`Invalid path for Parallels VM execution: "${file}"`)
+  }
+  // Validate the raw host path up-front and reject control bytes plus shell/UNC-significant
+  // metacharacters BEFORE it is concatenated into the \\Mac\... path passed to `prlctl exec`. The
+  // `/`→`\` conversion below only adds backslashes (not in the deny-set), so validating the input here
+  // is the single sanitizing barrier for the value that reaches the command.
+  // (CodeQL js/shell-command-constructed-from-input — sanitize the tainted input at the source.)
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1F\x7F"*?<>|]/.test(file)) {
+    throw new Error(`Invalid path for Parallels VM execution: "${file}"`)
+  }
+  // sanitizeDirPath additionally rejects null/newline and resolves the path; the input is already
+  // validated above, so the resulting UNC path is safe to hand to prlctl.
+  const sanitized = sanitizeDirPath(file)
+  // \\Mac\Home maps to the current user's home directory and is always accessible
+  // in both --current-user and SYSTEM exec contexts (unlike \\Mac\Host which requires
+  // "All Disks" sharing to be enabled in Parallels preferences).
+  const home = homedir()
+  // codeql[js/shell-command-constructed-from-input] - `file` is validated above (control bytes + shell/UNC metacharacters rejected) and resolved via sanitizeDirPath; the resulting UNC path is passed to prlctl as a discrete execFile argv element (array args, no shell), so no shell interpretation occurs
+  const uncPath = sanitized.startsWith(home + "/")
+    ? "\\\\Mac\\Home\\" + sanitized.substring(home.length + 1).replace(/\//g, "\\")
+    : "\\\\Mac\\Host\\" + sanitized.replace(/\//g, "\\")
+  return uncPath
 }
 
 export interface ParallelsVm {
   id: string
   name: string
-  os: "win-10" | "ubuntu" | "elementary"
+  os: "win-10" | "win-11" | "ubuntu" | "elementary"
   state: "running" | "suspended" | "stopped"
 }

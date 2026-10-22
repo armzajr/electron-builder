@@ -1,9 +1,12 @@
+import { stripSensitiveEnvVars } from "builder-util"
+import { Nullish } from "builder-util-runtime"
+
 export interface ToolInfo {
   path: string
   env?: any
 }
 
-export function computeEnv(oldValue: string | null | undefined, newValues: Array<string>): string {
+export function computeEnv(oldValue: string | Nullish, newValues: Array<string>): string {
   const parsedOldValue = oldValue ? oldValue.split(":") : []
   return newValues
     .concat(parsedOldValue)
@@ -14,7 +17,7 @@ export function computeEnv(oldValue: string | null | undefined, newValues: Array
 export function computeToolEnv(libPath: Array<string>): any {
   // noinspection SpellCheckingInspection
   return {
-    ...process.env,
+    ...stripSensitiveEnvVars(process.env),
     DYLD_LIBRARY_PATH: computeEnv(process.env.DYLD_LIBRARY_PATH, libPath),
   }
 }

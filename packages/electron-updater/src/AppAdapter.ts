@@ -24,9 +24,17 @@ export interface AppAdapter {
 
   whenReady(): Promise<void>
 
+  relaunch(): void
+
   quit(): void
 
   onQuit(handler: (exitCode: number) => void): void
+
+  /**
+   * Best-effort notification that the OS session is ending (shutdown / reboot / log off).
+   * Optional because not every adapter (or platform) can detect it.
+   */
+  onSessionEnd?(handler: () => void): void
 }
 
 export function getAppCacheDir() {
@@ -34,11 +42,11 @@ export function getAppCacheDir() {
   // https://github.com/electron/electron/issues/1404#issuecomment-194391247
   let result: string
   if (process.platform === "win32") {
-    result = process.env.LOCALAPPDATA || path.join(homedir, "AppData", "Local")
+    result = process.env["LOCALAPPDATA"] || path.join(homedir, "AppData", "Local")
   } else if (process.platform === "darwin") {
-    result = path.join(homedir, "Library", "Application Support", "Caches")
+    result = path.join(homedir, "Library", "Caches")
   } else {
-    result = process.env.XDG_CACHE_HOME || path.join(homedir, ".cache")
+    result = process.env["XDG_CACHE_HOME"] || path.join(homedir, ".cache")
   }
   return result
 }

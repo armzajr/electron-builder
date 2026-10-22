@@ -1,14 +1,23 @@
 import { GenericServerOptions, HttpError, newError, UpdateInfo } from "builder-util-runtime"
-import { AppUpdater } from "../AppUpdater"
-import { ResolvedUpdateFileInfo } from "../main"
-import { getChannelFilename, newBaseUrl, newUrlFromBase } from "../util"
-import { parseUpdateInfo, Provider, ProviderRuntimeOptions, resolveFiles } from "./Provider"
+import { AppUpdater } from "../AppUpdater.js"
+import { ResolvedUpdateFileInfo } from "../types.js"
+import { getChannelFilename, newBaseUrl, newUrlFromBase } from "../util.js"
+import { parseUpdateInfo, Provider, ProviderRuntimeOptions, resolveFiles } from "./Provider.js"
 
 export class GenericProvider extends Provider<UpdateInfo> {
-  private readonly baseUrl = newBaseUrl(this.configuration.url)
+  private readonly baseUrl: URL
 
-  constructor(private readonly configuration: GenericServerOptions, private readonly updater: AppUpdater, runtimeOptions: ProviderRuntimeOptions) {
+  constructor(
+    private readonly configuration: GenericServerOptions,
+    private readonly updater: AppUpdater,
+    runtimeOptions: ProviderRuntimeOptions
+  ) {
     super(runtimeOptions)
+    this.baseUrl = newBaseUrl(this.configuration.url)
+  }
+
+  get feedBaseUrl(): URL {
+    return this.baseUrl
   }
 
   private get channel(): string {
@@ -22,7 +31,7 @@ export class GenericProvider extends Provider<UpdateInfo> {
     for (let attemptNumber = 0; ; attemptNumber++) {
       try {
         return parseUpdateInfo(await this.httpRequest(channelUrl), channelFile, channelUrl)
-      } catch (e) {
+      } catch (e: any) {
         if (e instanceof HttpError && e.statusCode === 404) {
           throw newError(`Cannot find channel "${channelFile}" update info: ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
         } else if (e.code === "ECONNREFUSED") {
@@ -30,7 +39,7 @@ export class GenericProvider extends Provider<UpdateInfo> {
             await new Promise((resolve, reject) => {
               try {
                 setTimeout(resolve, 1000 * attemptNumber)
-              } catch (e) {
+              } catch (e: any) {
                 reject(e)
               }
             })

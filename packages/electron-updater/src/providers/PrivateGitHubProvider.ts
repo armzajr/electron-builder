@@ -2,20 +2,30 @@ import { CancellationToken, GithubOptions, HttpError, newError, UpdateInfo } fro
 import { OutgoingHttpHeaders, RequestOptions } from "http"
 import { load } from "js-yaml"
 import * as path from "path"
-import { AppUpdater } from "../AppUpdater"
+import { AppUpdater } from "../AppUpdater.js"
 import { URL } from "url"
-import { getChannelFilename, newUrlFromBase } from "../util"
-import { BaseGitHubProvider } from "./GitHubProvider"
-import { ResolvedUpdateFileInfo } from "../main"
-import { getFileList, ProviderRuntimeOptions } from "./Provider"
+import { getChannelFilename, newUrlFromBase } from "../util.js"
+import { BaseGitHubProvider } from "./GitHubProvider.js"
+import { ResolvedUpdateFileInfo } from "../types.js"
+import { channelFileNotFoundError, getFileList, ProviderRuntimeOptions } from "./Provider.js"
 
 export interface PrivateGitHubUpdateInfo extends UpdateInfo {
   assets: Array<Asset>
 }
 
 export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdateInfo> {
-  constructor(options: GithubOptions, private readonly updater: AppUpdater, private readonly token: string, runtimeOptions: ProviderRuntimeOptions) {
+  constructor(
+    options: GithubOptions,
+    private readonly updater: AppUpdater,
+    private readonly token: string,
+    runtimeOptions: ProviderRuntimeOptions
+  ) {
     super(options, "api.github.com", runtimeOptions)
+  }
+
+  // the asset URLs come from the GitHub API (api.github.com or the Enterprise host), not from latest*.yml, and need the token
+  get feedBaseUrl(): null {
+    return null
   }
 
   protected createRequestOptions(url: URL, headers?: OutgoingHttpHeaders | null): RequestOptions {
@@ -39,9 +49,9 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
     let result: any
     try {
       result = load((await this.httpRequest(url, this.configureHeaders("application/octet-stream"), cancellationToken))!)
-    } catch (e) {
+    } catch (e: any) {
       if (e instanceof HttpError && e.statusCode === 404) {
-        throw newError(`Cannot find ${channelFile} in the latest release artifacts (${url}): ${e.stack || e.message}`, "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND")
+        throw channelFileNotFoundError(channelFile, url, e)
       }
       throw e
     }
@@ -54,7 +64,6 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
     return this.configureHeaders("application/octet-stream")
   }
 
-  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
   private configureHeaders(accept: string) {
     return {
       accept,
@@ -72,12 +81,14 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
     const url = newUrlFromBase(basePath, this.baseUrl)
     try {
       const version = JSON.parse((await this.httpRequest(url, this.configureHeaders("application/vnd.github.v3+json"), cancellationToken))!)
+      // only `latest` can return a single ReleaseInfo. Otherwise, a list of ReleaseInfo is returned and we need to find the latest one ourselves
       if (allowPrerelease) {
-        return (version as Array<{ prerelease: boolean }>).find(it => it.prerelease) || version[0]
+        const candidates = (version as Array<ReleaseInfo>).filter(it => !it.draft)
+        return candidates.find(it => it.prerelease) || candidates[0]
       } else {
         return version
       }
-    } catch (e) {
+    } catch (e: any) {
       throw newError(`Unable to find latest version on GitHub (${url}), please ensure a production release exists: ${e.stack || e.message}`, "ERR_UPDATER_LATEST_VERSION_NOT_FOUND")
     }
   }
@@ -105,6 +116,8 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
 interface ReleaseInfo {
   name: string
   html_url: string
+  draft: boolean
+  prerelease: boolean
   assets: Array<Asset>
 }
 
